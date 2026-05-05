@@ -20,9 +20,6 @@ _ENV_CLIENT   = os.environ.get("DEFAULT_CLIENT", "")
 _ENV_PROJECT  = os.environ.get("DEFAULT_PROJECT", "")
 _ENV_LOCATION = os.environ.get("DEFAULT_LOCATION", "In Office")
 
-PLACEHOLDER = "Please Fill Account"
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -66,21 +63,44 @@ def _effective(ctx: dict, key: str, env_val: str) -> str:
     return ctx.get(key) or env_val or ""
 
 
-def _find_next_placeholder_row(ws) -> int:
-    """1-based row of the first placeholder row after the last real data row (any client)."""
+def _find_next_available_row(ws, date_str: str, needed: int = 1) -> int:
+    """1-based row number of the next available row for the given date.
+
+    A row is considered available (not yet filled) if it has 0/empty hours
+    and an empty description — the natural state of a template row.
+
+    Priority:
+    1. Rows pre-populated with the target date that are not yet filled.
+    2. Truly blank rows (no date at all).
+    3. Append new rows if the sheet has no room.
+    """
     all_vals = ws.get_all_values()
-    last_real = max(
-        (
-            i + 1
-            for i, row in enumerate(all_vals)
-            if len(row) > 5 and row[5].strip() and row[5] not in (PLACEHOLDER, "Client")
-        ),
-        default=4,
-    )
-    for i in range(last_real, len(all_vals)):
-        if len(all_vals[i]) > 5 and all_vals[i][5] == PLACEHOLDER:
-            return i + 1
-    raise RuntimeError("No placeholder rows available — add more rows to the sheet.")
+
+    def _is_available(row):
+        hours = row[4].strip() if len(row) > 4 else ""
+        description = row[8].strip() if len(row) > 8 else ""
+        return (not hours or hours == "0") and not description
+
+    date_rows = [
+        i + 5
+        for i, row in enumerate(all_vals[4:])
+        if row and row[0].strip() == date_str and _is_available(row)
+    ]
+    if len(date_rows) >= needed:
+        return date_rows[0]
+
+    blank_rows = [
+        i + 5
+        for i, row in enumerate(all_vals[4:])
+        if not row or not row[0].strip()
+    ]
+    combined = date_rows + blank_rows
+    if len(combined) >= needed:
+        return combined[0]
+
+    shortfall = needed - len(combined)
+    ws.add_rows(shortfall)
+    return combined[0] if combined else len(all_vals) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -271,8 +291,8 @@ def append_timesheet_rows(rows: list[dict], date: str = None) -> str:
     gc = _gc()
     ws = gc.open_by_key(SHEET_ID).worksheet(_tab_name(dt))
 
-    next_row = _find_next_placeholder_row(ws)
     date_str = _fmt_date(dt)
+    next_row = _find_next_available_row(ws, date_str, needed=len(rows))
 
     for i, row in enumerate(rows):
         r = next_row + i
@@ -373,10 +393,7 @@ def delete_timesheet_row(row_number: int, date: str = None) -> str:
     ws = gc.open_by_key(SHEET_ID).worksheet(_tab_name(dt))
 
     ws.update(values=[[""]], range_name=f"A{row_number}")
-    ws.update(
-        values=[["", "", PLACEHOLDER, "", "", "", ""]],
-        range_name=f"D{row_number}:J{row_number}",
-    )
+    ws.update(values=[["", "", "", "", "", "", ""]], range_name=f"D{row_number}:J{row_number}")
     return f"Deleted row {row_number}."
 
 
