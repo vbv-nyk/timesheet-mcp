@@ -63,11 +63,48 @@ def _effective(ctx: dict, key: str, env_val: str) -> str:
     return ctx.get(key) or env_val or ""
 
 
+def _normalize_date_str(s: str) -> str:
+    """Normalize a date string to the same format as _fmt_date (no leading zero in day)."""
+    for fmt in ["%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y"]:
+        try:
+            return _fmt_date(datetime.strptime(s.strip(), fmt))
+        except ValueError:
+            continue
+    return s.strip()
+
+
+_PLACEHOLDER_CLIENTS  = {"please fill account", "plese fill account"}
+_PLACEHOLDER_PROJECTS = {"please fill project", "plese fill project"}
+
+
+def _is_placeholder(row) -> bool:
+    client  = row[5].strip().lower() if len(row) > 5 else ""
+    project = row[6].strip().lower() if len(row) > 6 else ""
+    return client in _PLACEHOLDER_CLIENTS or project in _PLACEHOLDER_PROJECTS
+
+
+def _purge_placeholder_rows(ws, all_vals) -> list:
+    """Clear all rows that contain placeholder client/project values."""
+    row_numbers = [
+        i + 5
+        for i, row in enumerate(all_vals[4:])
+        if row and _is_placeholder(row)
+    ]
+    if row_numbers:
+        ranges = [f"A{r}:J{r}" for r in row_numbers]
+        ws.batch_clear(ranges)
+        for r in row_numbers:
+            all_vals[4 + r - 5] = []
+    return all_vals
+
+
 def _find_next_available_row(ws, date_str: str, needed: int = 1) -> int:
     """1-based row number of the next available row for the given date.
 
-    A row is considered available (not yet filled) if it has 0/empty hours
-    and an empty description — the natural state of a template row.
+    A row is available if its Type column (H, index 7) is empty. Type is always
+    explicitly set when logging, so an empty Type means the row is unused.
+
+    Placeholder rows (old buggy "Please Fill Account" junk) are purged first.
 
     Priority:
     1. Rows pre-populated with the target date that are not yet filled.
@@ -75,16 +112,16 @@ def _find_next_available_row(ws, date_str: str, needed: int = 1) -> int:
     3. Append new rows if the sheet has no room.
     """
     all_vals = ws.get_all_values()
+    all_vals = _purge_placeholder_rows(ws, all_vals)
 
     def _is_available(row):
-        hours = row[4].strip() if len(row) > 4 else ""
-        description = row[8].strip() if len(row) > 8 else ""
-        return (not hours or hours == "0") and not description
+        entry_type = row[7].strip() if len(row) > 7 else ""
+        return not entry_type
 
     date_rows = [
         i + 5
         for i, row in enumerate(all_vals[4:])
-        if row and row[0].strip() == date_str and _is_available(row)
+        if row and _normalize_date_str(row[0]) == date_str and _is_available(row)
     ]
     if len(date_rows) >= needed:
         return date_rows[0]
@@ -282,7 +319,6 @@ def append_timesheet_rows(rows: list[dict], date: str = None) -> str:
     `date`: date string like "20-Apr-26", "2026-04-20", or "yesterday". Defaults to today.
     """
     ctx = _load_context()
-    employee = _effective(ctx, "employee", _ENV_EMPLOYEE)
     def_client   = _effective(ctx, "default_client", _ENV_CLIENT)
     def_project  = _effective(ctx, "default_project", _ENV_PROJECT)
     def_location = _effective(ctx, "default_location", _ENV_LOCATION) or "In Office"
@@ -294,21 +330,26 @@ def append_timesheet_rows(rows: list[dict], date: str = None) -> str:
     date_str = _fmt_date(dt)
     next_row = _find_next_available_row(ws, date_str, needed=len(rows))
 
+    day_name   = dt.strftime("%A")   # e.g. "Tuesday"
+    month_name = dt.strftime("%B")   # e.g. "May"
+    employee   = _effective(ctx, "employee", _ENV_EMPLOYEE)
+
     for i, row in enumerate(rows):
         r = next_row + i
-        # Columns B and C (Day/Month) are formula-driven + protected — skip them.
-        ws.update(values=[[date_str]], range_name=f"A{r}")
         ws.update(
             values=[[
+                date_str,
+                day_name,
+                month_name,
                 row.get("location", def_location),
                 row["hours"],
                 row.get("client", def_client),
                 row.get("project", def_project),
                 row["type"],
                 row.get("description", ""),
-                employee,
+                row.get("employee", employee),
             ]],
-            range_name=f"D{r}:J{r}",
+            range_name=f"A{r}:J{r}",
             value_input_option="USER_ENTERED",
         )
 
@@ -353,7 +394,7 @@ def update_timesheet_row(
     while len(row_data) < 10:
         row_data.append("")
 
-    # 0-based column indices: D=3, E=4, F=5, G=6, H=7, I=8, J=9
+    # 0-based column indices: A=0, B=1, C=2, D=3, E=4, F=5, G=6, H=7, I=8, J=9
     if location is not None:
         row_data[3] = location
     if hours is not None:
@@ -368,10 +409,10 @@ def update_timesheet_row(
         row_data[8] = description
     if employee is not None:
         row_data[9] = employee
-
     ws.update(
-        values=[[row_data[3], row_data[4], row_data[5], row_data[6], row_data[7], row_data[8], row_data[9]]],
-        range_name=f"D{row_number}:J{row_number}",
+        values=[[row_data[0], row_data[1], row_data[2], row_data[3], row_data[4],
+                 row_data[5], row_data[6], row_data[7], row_data[8], row_data[9]]],
+        range_name=f"A{row_number}:J{row_number}",
         value_input_option="USER_ENTERED",
     )
     return f"Updated row {row_number}."
@@ -392,8 +433,7 @@ def delete_timesheet_row(row_number: int, date: str = None) -> str:
     gc = _gc()
     ws = gc.open_by_key(SHEET_ID).worksheet(_tab_name(dt))
 
-    ws.update(values=[[""]], range_name=f"A{row_number}")
-    ws.update(values=[["", "", "", "", "", "", ""]], range_name=f"D{row_number}:J{row_number}")
+    ws.batch_clear([f"A{row_number}:J{row_number}"])
     return f"Deleted row {row_number}."
 
 
